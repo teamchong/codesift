@@ -161,9 +161,12 @@ export fn struct_match(
 }
 
 fn writeEmptyArray() void {
-    result_len = 2;
-    result_buf[0] = '[';
-    result_buf[1] = ']';
+    // Binary protocol: 4-byte count = 0
+    result_len = 4;
+    result_buf[0] = 0;
+    result_buf[1] = 0;
+    result_buf[2] = 0;
+    result_buf[3] = 0;
 }
 
 export fn get_result_ptr() [*]const u8 {
@@ -764,68 +767,66 @@ export fn get_ruleset_result_len() u32 {
     return result_len;
 }
 
-// ── Serialization ────────────────────────────────────────
+// ── Serialization (Binary protocol) ──────────────────────
+//
+// Binary format per match:
+//   [4B start_byte][4B end_byte][4B start_row][4B start_col][4B end_row][4B end_col][4B binding_count]
+//   per binding: [4B name_len][name_bytes][4B text_len][text_bytes]
+//
+// Header: [4B match_count] followed by match_count match records.
+// All integers are little-endian u32.
 
 fn serializeMatches(matches: *const matcher.MatchList, buf: *[MAX_OUTPUT]u8) u32 {
-    var stream = std.io.fixedBufferStream(buf);
-    var w = stream.writer();
+    var pos: usize = 0;
+    const slice = matches.slice();
 
-    w.writeByte('[') catch return 0;
+    // Header: match count
+    if (pos + 4 > MAX_OUTPUT) return 0;
+    writeU32LE(buf, pos, @intCast(slice.len));
+    pos += 4;
 
-    for (matches.slice(), 0..) |m, i| {
-        if (i > 0) w.writeByte(',') catch return 0;
-        w.writeAll("{\"start_row\":") catch return 0;
-        w.print("{d}", .{m.start_row}) catch return 0;
-        w.writeAll(",\"start_col\":") catch return 0;
-        w.print("{d}", .{m.start_col}) catch return 0;
-        w.writeAll(",\"end_row\":") catch return 0;
-        w.print("{d}", .{m.end_row}) catch return 0;
-        w.writeAll(",\"end_col\":") catch return 0;
-        w.print("{d}", .{m.end_col}) catch return 0;
-        w.writeAll(",\"start_byte\":") catch return 0;
-        w.print("{d}", .{m.start_byte}) catch return 0;
-        w.writeAll(",\"end_byte\":") catch return 0;
-        w.print("{d}", .{m.end_byte}) catch return 0;
+    for (slice) |m| {
+        // 7 fixed u32 fields = 28 bytes
+        if (pos + 28 > MAX_OUTPUT) return 0;
+        writeU32LE(buf, pos, m.start_byte);
+        pos += 4;
+        writeU32LE(buf, pos, m.end_byte);
+        pos += 4;
+        writeU32LE(buf, pos, m.start_row);
+        pos += 4;
+        writeU32LE(buf, pos, m.start_col);
+        pos += 4;
+        writeU32LE(buf, pos, m.end_row);
+        pos += 4;
+        writeU32LE(buf, pos, m.end_col);
+        pos += 4;
+        writeU32LE(buf, pos, m.bindings.count);
+        pos += 4;
 
-        // Serialize bindings
-        w.writeAll(",\"bindings\":{") catch return 0;
-        var first_b = true;
+        // Bindings
         for (m.bindings.items[0..m.bindings.count]) |b| {
-            if (!first_b) w.writeByte(',') catch return 0;
-            first_b = false;
-            w.writeByte('"') catch return 0;
-            w.writeAll(b.name[0..b.name_len]) catch return 0;
-            w.writeAll("\":\"") catch return 0;
-            writeJsonEscaped(w, b.text[0..b.text_len]) catch return 0;
-            w.writeByte('"') catch return 0;
+            // name_len + name + text_len + text
+            const needed = 4 + b.name_len + 4 + b.text_len;
+            if (pos + needed > MAX_OUTPUT) return 0;
+            writeU32LE(buf, pos, b.name_len);
+            pos += 4;
+            @memcpy(buf[pos..][0..b.name_len], b.name[0..b.name_len]);
+            pos += b.name_len;
+            writeU32LE(buf, pos, b.text_len);
+            pos += 4;
+            @memcpy(buf[pos..][0..b.text_len], b.text[0..b.text_len]);
+            pos += b.text_len;
         }
-        w.writeAll("}}") catch return 0;
     }
 
-    w.writeByte(']') catch return 0;
-    return @intCast(stream.pos);
+    return @intCast(pos);
 }
 
-/// Write a string with JSON escaping (handles \ " and control chars).
-fn writeJsonEscaped(w: anytype, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    // Control character -- write as \u00XX
-                    try w.writeAll("\\u00");
-                    try w.print("{x:0>2}", .{c});
-                } else {
-                    try w.writeByte(c);
-                }
-            },
-        }
-    }
+inline fn writeU32LE(buf: *[MAX_OUTPUT]u8, pos: usize, val: u32) void {
+    buf[pos] = @truncate(val);
+    buf[pos + 1] = @truncate(val >> 8);
+    buf[pos + 2] = @truncate(val >> 16);
+    buf[pos + 3] = @truncate(val >> 24);
 }
 
 // Force the compiler to analyze all referenced modules

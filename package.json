@@ -48,6 +48,8 @@
     "build:embed": "node scripts/embed-wasm.mjs",
     "build:js": "bun build src/js/index.ts src/js/cli.ts src/js/types.ts src/js/encoder.ts --outdir dist --target node --format esm --minify --sourcemap=external --splitting && bun x tsc --emitDeclarationOnly",
     "build": "bun run build:zig && bun run build:opt && bun run build:embed && bun run build:js",
+    "bench": "bun bench/index.ts",
+    "bench:compare": "bun bench/compare.ts",
     "test": "bun test",
     "test:zig": "zig build test",
     "prepublishOnly": "bun run build"
@@ -71,6 +73,7 @@
   "author": "Steven Chong",
   "license": "Apache-2.0",
   "devDependencies": {
+    "@ast-grep/napi": "^0.41.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"
   }

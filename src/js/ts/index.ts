@@ -75,8 +75,40 @@ function writeStr(s: string): [number, number] | null {
 function readResult(): Match[] {
   const ptr = wasm.get_result_ptr();
   const len = wasm.get_result_len();
-  if (len === 0) return [];
-  return JSON.parse(dec.decode(new Uint8Array(wasm.memory.buffer, ptr, len)));
+  if (len < 4) return [];
+
+  // Binary protocol: [4B count] then per match:
+  //   [4B sb][4B eb][4B sr][4B sc][4B er][4B ec][4B binding_count]
+  //   per binding: [4B name_len][name_bytes][4B text_len][text_bytes]
+  const view = new DataView(wasm.memory.buffer, ptr, len);
+  const count = view.getUint32(0, true);
+  if (count === 0) return [];
+
+  const matches: Match[] = [];
+  let offset = 4;
+
+  for (let i = 0; i < count; i++) {
+    const start_byte = view.getUint32(offset, true); offset += 4;
+    const end_byte = view.getUint32(offset, true); offset += 4;
+    const start_row = view.getUint32(offset, true); offset += 4;
+    const start_col = view.getUint32(offset, true); offset += 4;
+    const end_row = view.getUint32(offset, true); offset += 4;
+    const end_col = view.getUint32(offset, true); offset += 4;
+    const bindingCount = view.getUint32(offset, true); offset += 4;
+
+    const bindings: Record<string, string> = {};
+    for (let b = 0; b < bindingCount; b++) {
+      const nameLen = view.getUint32(offset, true); offset += 4;
+      const name = dec.decode(new Uint8Array(wasm.memory.buffer, ptr + offset, nameLen)); offset += nameLen;
+      const textLen = view.getUint32(offset, true); offset += 4;
+      const text = dec.decode(new Uint8Array(wasm.memory.buffer, ptr + offset, textLen)); offset += textLen;
+      bindings[name] = text;
+    }
+
+    matches.push({ start_byte, end_byte, start_row, start_col, end_row, end_col, bindings });
+  }
+
+  return matches;
 }
 
 function readRulesetResult(): Finding[] {
@@ -222,16 +254,23 @@ export function createScanner(
   wasm.dealloc(buf[0], buf[1]);
   if (srcHandle === 0) return noopScanner;
 
+  // Pattern cache: avoid recompiling the same pattern string on every match call
+  const patternCache = new Map<string, number>();
+
+  function cachedCompile(pattern: string): number {
+    let h = patternCache.get(pattern);
+    if (h !== undefined) return h;
+    h = compilePattern(pattern, lang);
+    if (h > 0) patternCache.set(pattern, h);
+    return h;
+  }
+
   function rawMatch(pattern: string): Match[] {
     if (srcHandle === 0) return [];
-    const patHandle = compilePattern(pattern, lang);
+    const patHandle = cachedCompile(pattern);
     if (patHandle === 0) return [];
-    try {
-      wasm.match_compiled(patHandle, srcHandle);
-      return readResult();
-    } finally {
-      freePattern(patHandle);
-    }
+    wasm.match_compiled(patHandle, srcHandle);
+    return readResult();
   }
 
   function rawKindMatch(kind: string): Match[] {
@@ -263,8 +302,8 @@ export function createScanner(
     root(): SgNode {
       wasm.node_root(srcHandle);
       const info = readNodeResult();
-      if (!info) return new SgNode(srcHandle, lang, source, sourceBytes, { kind: "program", sb: 0, eb: sourceBytes.length, sr: 0, sc: 0, er: 0, ec: 0, named: true, cc: 0, ncc: 0 }, true);
-      return new SgNode(srcHandle, lang, source, sourceBytes, info, true);
+      if (!info) return new SgNode(srcHandle, lang, source, sourceBytes, { kind: "program", sb: 0, eb: sourceBytes.length, sr: 0, sc: 0, er: 0, ec: 0, named: true, cc: 0, ncc: 0 }, true, cachedCompile);
+      return new SgNode(srcHandle, lang, source, sourceBytes, info, true, cachedCompile);
     },
 
     source,
@@ -272,6 +311,8 @@ export function createScanner(
     get _srcHandle() { return srcHandle; },
 
     free(): void {
+      for (const h of patternCache.values()) freePattern(h);
+      patternCache.clear();
       if (srcHandle > 0) {
         wasm.free_source(srcHandle);
         srcHandle = 0;
@@ -333,22 +374,24 @@ export class SgNode {
   private _sourceBytes: Uint8Array;
   private _info: NodeInfo;
   private _isRoot: boolean;
+  private _compile: ((pattern: string) => number) | null;
 
   /** @internal — use scanner.root() to create */
-  constructor(srcHandle: number, lang: Language, source: string, sourceBytes: Uint8Array, info: NodeInfo, isRoot = false) {
+  constructor(srcHandle: number, lang: Language, source: string, sourceBytes: Uint8Array, info: NodeInfo, isRoot = false, compileFn: ((pattern: string) => number) | null = null) {
     this._srcHandle = srcHandle;
     this._lang = lang;
     this._source = source;
     this._sourceBytes = sourceBytes;
     this._info = info;
     this._isRoot = isRoot;
+    this._compile = compileFn;
   }
 
   private _ir(): number { return this._isRoot ? 1 : 0; }
 
   private _makeNode(info: NodeInfo | null): SgNode | null {
     if (!info) return null;
-    return new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info);
+    return new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info, false, this._compile);
   }
 
   /** Node type string (e.g. "call_expression", "identifier"). */
@@ -435,9 +478,18 @@ export class SgNode {
     return this._makeNode(readNodeResult());
   }
 
+  private _compilePattern(pattern: string): number {
+    if (this._compile) return this._compile(pattern);
+    return compilePattern(pattern, this._lang);
+  }
+
+  private _freePatternIfUncached(handle: number): void {
+    if (!this._compile) freePattern(handle);
+  }
+
   /** Find first descendant matching a structural pattern. */
   find(pattern: string): SgNode | null {
-    const patHandle = compilePattern(pattern, this._lang);
+    const patHandle = this._compilePattern(pattern);
     if (patHandle === 0) return null;
     try {
       wasm.match_in_range(patHandle, this._srcHandle, this._info.sb, this._info.eb);
@@ -448,13 +500,13 @@ export class SgNode {
       const info = readNodeResult();
       return this._makeNode(info);
     } finally {
-      freePattern(patHandle);
+      this._freePatternIfUncached(patHandle);
     }
   }
 
   /** Find all descendants matching a structural pattern. */
   findAll(pattern: string): SgNode[] {
-    const patHandle = compilePattern(pattern, this._lang);
+    const patHandle = this._compilePattern(pattern);
     if (patHandle === 0) return [];
     try {
       wasm.match_in_range(patHandle, this._srcHandle, this._info.sb, this._info.eb);
@@ -468,24 +520,24 @@ export class SgNode {
         seen.add(key);
         wasm.node_info(this._srcHandle, m.start_byte, m.end_byte, 0);
         const info = readNodeResult();
-        if (info) nodes.push(new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info));
+        if (info) nodes.push(new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info, false, this._compile));
       }
       return nodes;
     } finally {
-      freePattern(patHandle);
+      this._freePatternIfUncached(patHandle);
     }
   }
 
   /** Check if this node matches a structural pattern. */
   matches(pattern: string): boolean {
-    const patHandle = compilePattern(pattern, this._lang);
+    const patHandle = this._compilePattern(pattern);
     if (patHandle === 0) return false;
     try {
       wasm.match_in_range(patHandle, this._srcHandle, this._info.sb, this._info.eb);
       const results = readResult();
       return results.some(m => m.start_byte === this._info.sb && m.end_byte === this._info.eb);
     } finally {
-      freePattern(patHandle);
+      this._freePatternIfUncached(patHandle);
     }
   }
 }

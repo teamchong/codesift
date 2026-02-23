@@ -378,7 +378,25 @@ fn matchChildSeq(
 
 // ── Search: find all matches of a pattern in a source tree ────
 
+/// Extract the node kind that a pattern's root must match.
+/// Returns null for metavariable/ellipsis patterns (match any kind).
+/// Unwraps expression_statement to match the actual target kind, since
+/// matchNode transparently unwraps expression_statement during matching.
+fn patternTargetKind(pattern_root: ts.Node) ?[]const u8 {
+    var pat = unwrapProgramRoot(pattern_root);
+    // matchNode unwraps expression_statement with 1 child — do the same here
+    if (std.mem.eql(u8, pat.nodeType(), "expression_statement") and pat.namedChildCount() == 1) {
+        if (pat.namedChild(0)) |inner| {
+            pat = inner;
+        }
+    }
+    const pat_text = pat.text();
+    if (isMetavar(pat_text) or isEllipsis(pat_text) or isEllipsisMetavar(pat_text)) return null;
+    return pat.nodeType();
+}
+
 /// Walk the entire source tree and collect all nodes that match the pattern.
+/// Uses kind-based pruning to skip nodes that can't match the pattern's root kind.
 pub fn searchMatches(
     pattern_root: ts.Node,
     source_root: ts.Node,
@@ -387,16 +405,47 @@ pub fn searchMatches(
 ) void {
     if (depth > 200) return;
 
-    // Try matching at this node
-    var bindings = Bindings{};
-    // Get the actual pattern node (skip program root wrapper if present)
     const pat = unwrapProgramRoot(pattern_root);
-    if (matchNode(pat, source_root, &bindings, 0)) {
-        const sb = source_root.startByte();
-        const eb = source_root.endByte();
+    const target_kind = patternTargetKind(pattern_root);
+
+    searchMatchesInner(pat, source_root, matches, depth, target_kind);
+}
+
+fn searchMatchesInner(
+    pat: ts.Node,
+    source_root: ts.Node,
+    matches: *MatchList,
+    depth: u32,
+    target_kind: ?[]const u8,
+) void {
+    if (depth > 200) return;
+
+    tryMatch(pat, source_root, matches, target_kind);
+
+    // Recurse into named children
+    var i: u32 = 0;
+    while (i < source_root.namedChildCount()) : (i += 1) {
+        if (source_root.namedChild(i)) |child| {
+            searchMatchesInner(pat, child, matches, depth + 1, target_kind);
+        }
+    }
+}
+
+/// Try matching the pattern at a single source node, with optional kind pruning.
+fn tryMatch(pat: ts.Node, source_node: ts.Node, matches: *MatchList, target_kind: ?[]const u8) void {
+    // Kind-based pruning: skip matchNode if source kind doesn't match pattern kind
+    if (target_kind) |tk| {
+        const src_type = source_node.nodeType();
+        if (!std.mem.eql(u8, src_type, tk) and !std.mem.eql(u8, src_type, "expression_statement")) return;
+    }
+
+    var bindings = Bindings{};
+    if (matchNode(pat, source_node, &bindings, 0)) {
+        const sb = source_node.startByte();
+        const eb = source_node.endByte();
         if (!isDuplicate(matches.slice(), sb, eb)) {
-            const sp = source_root.startPoint();
-            const ep = source_root.endPoint();
+            const sp = source_node.startPoint();
+            const ep = source_node.endPoint();
             matches.add(.{
                 .start_byte = sb,
                 .end_byte = eb,
@@ -406,14 +455,6 @@ pub fn searchMatches(
                 .end_col = ep.col,
                 .bindings = bindings,
             });
-        }
-    }
-
-    // Recurse into children
-    var i: u32 = 0;
-    while (i < source_root.namedChildCount()) : (i += 1) {
-        if (source_root.namedChild(i)) |child| {
-            searchMatches(pattern_root, child, matches, depth + 1);
         }
     }
 }
@@ -558,6 +599,7 @@ pub fn collectByKindAll(source_root: ts.Node, kind: []const u8, matches: *MatchL
 // ── Range-constrained matching ────────────────────────────────
 
 /// Same as searchMatches but skips nodes outside [range_start, range_end).
+/// Uses kind-based pruning.
 pub fn searchMatchesInRange(
     pattern_root: ts.Node,
     source_root: ts.Node,
@@ -574,34 +616,50 @@ pub fn searchMatchesInRange(
     // Skip nodes entirely outside the range
     if (node_end <= range_start or node_start >= range_end) return;
 
+    const pat = unwrapProgramRoot(pattern_root);
+    const target_kind = patternTargetKind(pattern_root);
+
     // Try matching at this node if it's within range
     if (node_start >= range_start and node_end <= range_end) {
-        var bindings = Bindings{};
-        const pat = unwrapProgramRoot(pattern_root);
-        if (matchNode(pat, source_root, &bindings, 0)) {
-            const sb = source_root.startByte();
-            const eb = source_root.endByte();
-            if (!isDuplicate(matches.slice(), sb, eb)) {
-                const sp = source_root.startPoint();
-                const ep = source_root.endPoint();
-                matches.add(.{
-                    .start_byte = sb,
-                    .end_byte = eb,
-                    .start_row = sp.row,
-                    .start_col = sp.col,
-                    .end_row = ep.row,
-                    .end_col = ep.col,
-                    .bindings = bindings,
-                });
-            }
-        }
+        tryMatch(pat, source_root, matches, target_kind);
     }
 
-    // Recurse into children
+    // Recurse into named children
     var i: u32 = 0;
     while (i < source_root.namedChildCount()) : (i += 1) {
         if (source_root.namedChild(i)) |child_node| {
-            searchMatchesInRange(pattern_root, child_node, matches, depth + 1, range_start, range_end);
+            searchMatchesInRangeInner(pat, child_node, matches, depth + 1, range_start, range_end, target_kind);
+        }
+    }
+}
+
+fn searchMatchesInRangeInner(
+    pat: ts.Node,
+    source_root: ts.Node,
+    matches: *MatchList,
+    depth: u32,
+    range_start: u32,
+    range_end: u32,
+    target_kind: ?[]const u8,
+) void {
+    if (depth > 200) return;
+
+    const node_start = source_root.startByte();
+    const node_end = source_root.endByte();
+
+    // Skip nodes entirely outside the range
+    if (node_end <= range_start or node_start >= range_end) return;
+
+    // Try matching at this node if it's within range
+    if (node_start >= range_start and node_end <= range_end) {
+        tryMatch(pat, source_root, matches, target_kind);
+    }
+
+    // Recurse into named children
+    var i: u32 = 0;
+    while (i < source_root.namedChildCount()) : (i += 1) {
+        if (source_root.namedChild(i)) |child_node| {
+            searchMatchesInRangeInner(pat, child_node, matches, depth + 1, range_start, range_end, target_kind);
         }
     }
 }
