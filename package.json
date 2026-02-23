@@ -1,0 +1,77 @@
+{
+  "name": "codesift",
+  "version": "0.1.0",
+  "description": "Embeddable WASM-based structural code pattern matcher for JS/TS",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "codesift": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./ts": {
+      "types": "./dist/ts/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js",
+      "default": "./dist/types.js"
+    },
+    "./encoder": {
+      "types": "./dist/encoder.d.ts",
+      "import": "./dist/encoder.js",
+      "default": "./dist/encoder.js"
+    },
+    "./engine.wasm": "./dist/engine.wasm"
+  },
+  "sideEffects": [
+    "./dist/index.js"
+  ],
+  "files": [
+    "dist/",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:zig": "zig build -Doptimize=ReleaseSmall",
+    "build:opt": "wasm-opt -Oz --strip-producers --strip-target-features dist/engine.wasm -o dist/engine.wasm --enable-bulk-memory --enable-sign-ext --enable-mutable-globals || echo 'wasm-opt not found, skipping optimization'",
+    "build:embed": "node scripts/embed-wasm.mjs",
+    "build:js": "bun build src/js/index.ts src/js/cli.ts src/js/types.ts src/js/encoder.ts --outdir dist --target node --format esm --minify --sourcemap=external --splitting && bun x tsc --emitDeclarationOnly",
+    "build": "bun run build:zig && bun run build:opt && bun run build:embed && bun run build:js",
+    "test": "bun test",
+    "test:zig": "zig build test",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": [
+    "ast",
+    "pattern-matching",
+    "static-analysis",
+    "linter",
+    "wasm",
+    "javascript",
+    "typescript",
+    "tree-sitter",
+    "structural-search"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teamchong/codesift.git"
+  },
+  "homepage": "https://github.com/teamchong/codesift#readme",
+  "author": "Steven Chong",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

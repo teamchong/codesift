@@ -1,0 +1,13 @@
+.{
+    .fingerprint = 0xde4c7795e5f90598,
+    .name = .codesift,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.14.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor",
+    },
+    .dependencies = .{},
+}
