@@ -21,37 +21,11 @@ import {
 } from "../src/js/ts/index.js";
 import { encodeRules } from "../src/js/encoder.js";
 import type { RuleDefinition } from "../src/js/types.js";
+import { bench, formatOps, formatNs, type BenchResult } from "./utils.js";
 
 // ── Helpers ──────────────────────────────────────────────
 
-function bench(name: string, fn: () => void, iterations = 1_000): { name: string; opsPerSec: number; avgNs: number } {
-  // Warmup
-  for (let i = 0; i < Math.min(iterations, 50); i++) fn();
-
-  const start = performance.now();
-  for (let i = 0; i < iterations; i++) fn();
-  const elapsed = performance.now() - start;
-
-  const avgMs = elapsed / iterations;
-  const avgNs = avgMs * 1_000_000;
-  const opsPerSec = 1000 / avgMs;
-
-  return { name, opsPerSec, avgNs };
-}
-
-function formatOps(ops: number): string {
-  if (ops >= 1_000_000) return `${(ops / 1_000_000).toFixed(2)}M`;
-  if (ops >= 1_000) return `${(ops / 1_000).toFixed(2)}K`;
-  return ops.toFixed(2);
-}
-
-function formatNs(ns: number): string {
-  if (ns >= 1_000_000) return `${(ns / 1_000_000).toFixed(2)} ms`;
-  if (ns >= 1_000) return `${(ns / 1_000).toFixed(2)} µs`;
-  return `${ns.toFixed(0)} ns`;
-}
-
-function printResults(group: string, results: { name: string; opsPerSec: number; avgNs: number }[]) {
+function printResults(group: string, results: BenchResult[]) {
   const maxNameLen = Math.max(...results.map(r => r.name.length));
   console.log(`\n── ${group} ${"─".repeat(60 - group.length)}`);
   for (const r of results) {

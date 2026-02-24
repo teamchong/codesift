@@ -59,6 +59,12 @@ describe("dist/index.js (main entry)", async () => {
     expect(typeof mod.isWasmLanguage).toBe("function");
   });
 
+  it("exports trace functions", () => {
+    expect(typeof mod.trace).toBe("function");
+    expect(typeof mod.traceFile).toBe("function");
+    expect(typeof mod.rewriteSource).toBe("function");
+  });
+
   it("exports match slot operations", () => {
     expect(typeof mod.storeMatches).toBe("function");
     expect(typeof mod.filterInside).toBe("function");
@@ -96,6 +102,13 @@ describe("dist/index.js (main entry)", async () => {
     expect(mod.detectLanguage("foo.ts")).toBe("typescript");
     expect(mod.detectLanguage("foo.tsx")).toBe("tsx");
     expect(mod.detectLanguage("foo.js")).toBe("javascript");
+  });
+
+  it("trace works end-to-end", () => {
+    const result = mod.trace("import fs from 'fs'; fs.readFileSync('x');", "javascript");
+    expect(result.events.length).toBeGreaterThan(0);
+    expect(result.timedOut).toBe(false);
+    expect(typeof result.durationMs).toBe("number");
   });
 
   it("scanner.root() returns SgNode for tree traversal", () => {

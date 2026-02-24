@@ -121,20 +121,23 @@ function readRulesetResult(): Finding[] {
   return JSON.parse(dec.decode(new Uint8Array(wasm.memory.buffer, ptr, len)));
 }
 
-function readNodeResult(): NodeInfo | null {
+function readResultJson(): string | null {
   const ptr = wasm.get_result_ptr();
   const len = wasm.get_result_len();
   if (len === 0) return null;
-  const str = dec.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
-  if (str === "null") return null;
+  return dec.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+}
+
+function readNodeResult(): NodeInfo | null {
+  const str = readResultJson();
+  if (!str || str === "null") return null;
   return JSON.parse(str);
 }
 
 function readNodeArrayResult(): NodeInfo[] {
-  const ptr = wasm.get_result_ptr();
-  const len = wasm.get_result_len();
-  if (len === 0) return [];
-  return JSON.parse(dec.decode(new Uint8Array(wasm.memory.buffer, ptr, len)));
+  const str = readResultJson();
+  if (!str) return [];
+  return JSON.parse(str);
 }
 
 // ── Pattern matching ─────────────────────────────────────
@@ -411,13 +414,13 @@ export class SgNode {
   /** Get all children (named + anonymous). */
   children(): SgNode[] {
     wasm.node_children(this._srcHandle, this._info.sb, this._info.eb, this._ir());
-    return readNodeArrayResult().map(info => new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info));
+    return readNodeArrayResult().map(info => this._makeNode(info)!);
   }
 
   /** Get named children only. */
   namedChildren(): SgNode[] {
     wasm.node_named_children(this._srcHandle, this._info.sb, this._info.eb, this._ir());
-    return readNodeArrayResult().map(info => new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info));
+    return readNodeArrayResult().map(info => this._makeNode(info)!);
   }
 
   /** Get child by index (all children). */
@@ -505,7 +508,8 @@ export class SgNode {
         seen.add(key);
         wasm.node_info(this._srcHandle, m.start_byte, m.end_byte, 0);
         const info = readNodeResult();
-        if (info) nodes.push(new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info, false, this._compile));
+        const node = this._makeNode(info);
+        if (node) nodes.push(node);
       }
       return nodes;
     } finally {

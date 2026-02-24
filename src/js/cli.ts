@@ -30,17 +30,10 @@ function parseArgs(argv: string[]): ParsedArgs {
 
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (arg.startsWith("--")) {
-      const key = arg.slice(2);
-      const next = args[i + 1];
-      if (next && !next.startsWith("--")) {
-        flags[key] = next;
-        i++;
-      } else {
-        flags[key] = true;
-      }
-    } else if (arg.startsWith("-") && arg.length === 2) {
-      const key = arg.slice(1);
+    const isLong = arg.startsWith("--");
+    const isShort = !isLong && arg.startsWith("-") && arg.length === 2;
+    if (isLong || isShort) {
+      const key = arg.slice(isLong ? 2 : 1);
       const next = args[i + 1];
       if (next && !next.startsWith("-")) {
         flags[key] = next;

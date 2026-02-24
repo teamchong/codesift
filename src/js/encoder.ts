@@ -1,4 +1,5 @@
-import type { RuleDefinition, RuleNode, StopBy, Language } from "./types.js";
+import { langToInt } from "./types.js";
+import type { RuleDefinition, RuleNode, StopBy } from "./types.js";
 
 // ── Opcodes ──────────────────────────────────────────────
 
@@ -29,14 +30,6 @@ const SEVERITY_MAP: Record<string, number> = {
   warning: 1,
   info: 2,
   hint: 3,
-};
-
-// ── Language mapping ─────────────────────────────────────
-
-const LANG_MAP: Record<Language, number> = {
-  javascript: 1,
-  typescript: 2,
-  tsx: 3,
 };
 
 // ── Encoder ──────────────────────────────────────────────
@@ -95,7 +88,7 @@ function encodeRule(
   w.writeString(rule.id);
   w.writeU8(SEVERITY_MAP[rule.severity ?? "error"] ?? 0);
   w.writeString(rule.message);
-  w.writeU8(LANG_MAP[rule.language] ?? 0);
+  w.writeU8(langToInt(rule.language));
 
   const constraintEntries = rule.constraints
     ? Object.entries(rule.constraints)
@@ -185,22 +178,12 @@ function encodeRuleNode(
   } else if ("not" in node) {
     w.writeU8(OP_NOT);
     encodeRuleNode(w, node.not, ruleIndexMap);
-  } else if ("inside" in node) {
-    w.writeU8(OP_INSIDE);
-    encodeStopBy(w, node.stopBy, ruleIndexMap);
-    encodeRuleNode(w, node.inside, ruleIndexMap);
-  } else if ("has" in node) {
-    w.writeU8(OP_HAS);
-    encodeStopBy(w, node.stopBy, ruleIndexMap);
-    encodeRuleNode(w, node.has, ruleIndexMap);
-  } else if ("follows" in node) {
-    w.writeU8(OP_FOLLOWS);
-    encodeStopBy(w, node.stopBy, ruleIndexMap);
-    encodeRuleNode(w, node.follows, ruleIndexMap);
-  } else if ("precedes" in node) {
-    w.writeU8(OP_PRECEDES);
-    encodeStopBy(w, node.stopBy, ruleIndexMap);
-    encodeRuleNode(w, node.precedes, ruleIndexMap);
+  } else if ("inside" in node || "has" in node || "follows" in node || "precedes" in node) {
+    const relOps = { inside: OP_INSIDE, has: OP_HAS, follows: OP_FOLLOWS, precedes: OP_PRECEDES } as const;
+    const key = (Object.keys(relOps) as Array<keyof typeof relOps>).find(k => k in node)!;
+    w.writeU8(relOps[key]);
+    encodeStopBy(w, (node as any).stopBy, ruleIndexMap);
+    encodeRuleNode(w, (node as any)[key], ruleIndexMap);
   } else if ("matches" in node) {
     w.writeU8(OP_MATCHES);
     w.writeU16(ruleIndexMap.get(node.matches) ?? 0);
