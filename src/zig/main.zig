@@ -18,51 +18,8 @@
 ///!   free_source(handle)             ->        Free cached source
 
 const std = @import("std");
-const builtin = @import("builtin");
 const rules = @import("rules.zig");
-
-// ── Allocator ────────────────────────────────────────────
-//
-// On wasm32 we wrap the C dlmalloc (compiled from sysroot/dlmalloc.c)
-// so that Zig allocations and tree-sitter's malloc/free share the SAME
-// heap. Using Zig's WasmAllocator would create a second allocator that
-// also calls memory.grow, causing heap region collisions after many
-// alloc/free cycles.
-//
-// On native targets (tests) we use the page allocator.
-
-extern fn malloc(usize) ?[*]u8;
-extern fn free(?[*]u8) void;
-extern fn realloc(?[*]u8, usize) ?[*]u8;
-
-const dlmalloc_vtable = std.mem.Allocator.VTable{
-    .alloc = dlmallocAlloc,
-    .resize = dlmallocResize,
-    .free = dlmallocFree,
-    .remap = dlmallocRemap,
-};
-
-fn dlmallocAlloc(_: *anyopaque, len: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
-    return malloc(len);
-}
-
-fn dlmallocResize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
-    // dlmalloc doesn't support in-place resize; always fail.
-    return false;
-}
-
-fn dlmallocRemap(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) ?[*]u8 {
-    return realloc(memory.ptr, new_len);
-}
-
-fn dlmallocFree(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
-    free(memory.ptr);
-}
-
-const gpa: std.mem.Allocator = if (builtin.target.cpu.arch == .wasm32)
-    .{ .ptr = undefined, .vtable = &dlmalloc_vtable }
-else
-    std.heap.page_allocator;
+const gpa = @import("alloc.zig").gpa;
 
 // ── Output buffer ────────────────────────────────────────
 
@@ -94,6 +51,15 @@ const ts = @import("ts_bridge.zig");
 var result_buf: [MAX_OUTPUT]u8 = undefined;
 var result_len: u32 = 0;
 
+fn toTsLang(lang: u32) ts.Language {
+    const language: rules.Language = @enumFromInt(@as(u8, @truncate(lang)));
+    return switch (language) {
+        .javascript => .javascript,
+        .typescript => .typescript,
+        .tsx => .tsx,
+    };
+}
+
 // Static parser pool — avoids repeated alloc/free of tree-sitter parsers
 // which exhaust dlmalloc's WASM heap after multiple calls.
 var static_js_parser: ?ts.Parser = null;
@@ -119,13 +85,7 @@ export fn struct_match(
 ) void {
     const pattern_source = pattern_ptr[0..pattern_len];
     const source = source_ptr[0..source_len];
-    const language: rules.Language = @enumFromInt(@as(u8, @truncate(lang)));
-
-    const ts_lang: ts.Language = switch (language) {
-        .javascript => .javascript,
-        .typescript => .typescript,
-        .tsx => .tsx,
-    };
+    const ts_lang = toTsLang(lang);
 
     // Reuse static parsers to avoid dlmalloc heap exhaustion in WASM.
     const parser = getOrInitParser(ts_lang) orelse {
@@ -212,13 +172,7 @@ export fn compile_pattern(
 ) u32 {
     const slot_idx = findFreeSlot() orelse return 0;
     const pattern_source = pattern_ptr[0..pattern_len];
-    const language: rules.Language = @enumFromInt(@as(u8, @truncate(lang)));
-
-    const ts_lang: ts.Language = switch (language) {
-        .javascript => .javascript,
-        .typescript => .typescript,
-        .tsx => .tsx,
-    };
+    const ts_lang = toTsLang(lang);
 
     const parser = getOrInitParser(ts_lang) orelse return 0;
 
@@ -328,13 +282,7 @@ export fn compile_source(
 ) u32 {
     const slot_idx = findFreeSourceSlot() orelse return 0;
     const source = source_ptr[0..source_len];
-    const language: rules.Language = @enumFromInt(@as(u8, @truncate(lang)));
-
-    const ts_lang: ts.Language = switch (language) {
-        .javascript => .javascript,
-        .typescript => .typescript,
-        .tsx => .tsx,
-    };
+    const ts_lang = toTsLang(lang);
 
     const parser = getOrInitParser(ts_lang) orelse return 0;
 
@@ -511,33 +459,26 @@ export fn match_in_range(pat_handle: u32, src_handle: u32, start_byte: u32, end_
 
 /// Match a pattern against preceding siblings of a node.
 export fn match_preceding(pat_handle: u32, src_handle: u32, node_start: u32, node_end: u32) void {
-    if (pat_handle == 0 or pat_handle > MAX_COMPILED) { writeEmptyArray(); return; }
-    if (src_handle == 0 or src_handle > MAX_SOURCES) { writeEmptyArray(); return; }
-    const pat_slot = compiled_slots[pat_handle - 1] orelse { writeEmptyArray(); return; };
-    const src_slot = source_slots[src_handle - 1] orelse { writeEmptyArray(); return; };
-
-    // Collect preceding siblings
-    var sibling_matches = matcher.MatchList{};
-    matcher.collectPrecedingSiblings(src_slot.tree.rootNode(), node_start, node_end, &sibling_matches);
-
-    // Match pattern against each sibling
-    var matches = matcher.MatchList{};
-    for (sibling_matches.slice()) |sib| {
-        matcher.searchMatchesInRange(pat_slot.tree.rootNode(), src_slot.tree.rootNode(), &matches, 0, sib.start_byte, sib.end_byte);
-    }
-    last_match_list = matches;
-    result_len = serializeMatches(&matches, &result_buf);
+    matchSiblings(pat_handle, src_handle, node_start, node_end, true);
 }
 
 /// Match a pattern against following siblings of a node.
 export fn match_following(pat_handle: u32, src_handle: u32, node_start: u32, node_end: u32) void {
+    matchSiblings(pat_handle, src_handle, node_start, node_end, false);
+}
+
+fn matchSiblings(pat_handle: u32, src_handle: u32, node_start: u32, node_end: u32, preceding: bool) void {
     if (pat_handle == 0 or pat_handle > MAX_COMPILED) { writeEmptyArray(); return; }
     if (src_handle == 0 or src_handle > MAX_SOURCES) { writeEmptyArray(); return; }
     const pat_slot = compiled_slots[pat_handle - 1] orelse { writeEmptyArray(); return; };
     const src_slot = source_slots[src_handle - 1] orelse { writeEmptyArray(); return; };
 
     var sibling_matches = matcher.MatchList{};
-    matcher.collectFollowingSiblings(src_slot.tree.rootNode(), node_start, node_end, &sibling_matches);
+    if (preceding) {
+        matcher.collectPrecedingSiblings(src_slot.tree.rootNode(), node_start, node_end, &sibling_matches);
+    } else {
+        matcher.collectFollowingSiblings(src_slot.tree.rootNode(), node_start, node_end, &sibling_matches);
+    }
 
     var matches = matcher.MatchList{};
     for (sibling_matches.slice()) |sib| {
@@ -597,11 +538,7 @@ fn serializeNodeOrNull(maybe_node: ?ts.Node, buf: *[MAX_OUTPUT]u8) u32 {
         serializeNodeInfo(node, stream.writer()) catch return 0;
         return @intCast(stream.pos);
     }
-    buf[0] = 'n';
-    buf[1] = 'u';
-    buf[2] = 'l';
-    buf[3] = 'l';
-    return 4;
+    return writeNullTo(buf);
 }
 
 /// Get root node info. Returns JSON object.
@@ -621,29 +558,15 @@ export fn node_info(src_handle: u32, start_byte: u32, end_byte: u32, is_root: u3
 
 /// Get all children of a node. Returns JSON array.
 export fn node_children(src_handle: u32, start_byte: u32, end_byte: u32, is_root: u32) void {
-    if (src_handle == 0 or src_handle > MAX_SOURCES) { writeEmptyArray(); return; }
-    const src_slot = source_slots[src_handle - 1] orelse { writeEmptyArray(); return; };
-    const node = findNode(&src_slot, start_byte, end_byte, is_root) orelse { writeEmptyArray(); return; };
-
-    var stream = std.io.fixedBufferStream(&result_buf);
-    var w = stream.writer();
-    w.writeByte('[') catch { result_len = 0; return; };
-
-    const count = node.childCount();
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        if (node.child(i)) |ch| {
-            if (i > 0) w.writeByte(',') catch { result_len = 0; return; };
-            serializeNodeInfo(ch, w) catch { result_len = 0; return; };
-        }
-    }
-
-    w.writeByte(']') catch { result_len = 0; return; };
-    result_len = @intCast(stream.pos);
+    serializeChildren(src_handle, start_byte, end_byte, is_root, false);
 }
 
 /// Get named children of a node. Returns JSON array.
 export fn node_named_children(src_handle: u32, start_byte: u32, end_byte: u32, is_root: u32) void {
+    serializeChildren(src_handle, start_byte, end_byte, is_root, true);
+}
+
+fn serializeChildren(src_handle: u32, start_byte: u32, end_byte: u32, is_root: u32, named_only: bool) void {
     if (src_handle == 0 or src_handle > MAX_SOURCES) { writeEmptyArray(); return; }
     const src_slot = source_slots[src_handle - 1] orelse { writeEmptyArray(); return; };
     const node = findNode(&src_slot, start_byte, end_byte, is_root) orelse { writeEmptyArray(); return; };
@@ -652,14 +575,15 @@ export fn node_named_children(src_handle: u32, start_byte: u32, end_byte: u32, i
     var w = stream.writer();
     w.writeByte('[') catch { result_len = 0; return; };
 
-    const count = node.namedChildCount();
+    const count = if (named_only) node.namedChildCount() else node.childCount();
     var first = true;
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        if (node.namedChild(i)) |ch| {
+        const ch = if (named_only) node.namedChild(i) else node.child(i);
+        if (ch) |child| {
             if (!first) w.writeByte(',') catch { result_len = 0; return; };
             first = false;
-            serializeNodeInfo(ch, w) catch { result_len = 0; return; };
+            serializeNodeInfo(child, w) catch { result_len = 0; return; };
         }
     }
 
@@ -700,12 +624,16 @@ export fn node_prev(src_handle: u32, start_byte: u32, end_byte: u32, is_root: u3
     result_len = serializeNodeOrNull(node.prevNamedSibling(), &result_buf);
 }
 
+fn writeNullTo(buf: *[MAX_OUTPUT]u8) u32 {
+    buf[0] = 'n';
+    buf[1] = 'u';
+    buf[2] = 'l';
+    buf[3] = 'l';
+    return 4;
+}
+
 fn writeNull() void {
-    result_buf[0] = 'n';
-    result_buf[1] = 'u';
-    result_buf[2] = 'l';
-    result_buf[3] = 'l';
-    result_len = 4;
+    result_len = writeNullTo(&result_buf);
 }
 
 // ── Rule engine exports ──────────────────────────────────
@@ -745,7 +673,7 @@ export fn apply_ruleset(ruleset_handle: u32, src_handle: u32) void {
     const rs = &(ruleset_slots[ruleset_handle - 1] orelse { writeEmptyArray(); return; });
     const src_slot = source_slots[src_handle - 1] orelse { writeEmptyArray(); return; };
 
-    result_len = rule_engine.applyAndSerialize(rs, &src_slot, &compiled_slots, &source_slots, &result_buf);
+    result_len = rule_engine.applyAndSerialize(rs, &src_slot, &compiled_slots, &result_buf);
 }
 
 /// Free all compiled pattern handles and release ruleset slot.
@@ -831,6 +759,7 @@ inline fn writeU32LE(buf: *[MAX_OUTPUT]u8, pos: usize, val: u32) void {
 
 // Force the compiler to analyze all referenced modules
 comptime {
+    _ = @import("alloc.zig");
     _ = @import("matcher.zig");
     _ = @import("rule_engine.zig");
 }

@@ -19,13 +19,7 @@ const ts = @import("ts_bridge.zig");
 const rules_mod = @import("rules.zig");
 const regex = @import("regex");
 
-// ── Allocator ─────────────────────────────────────────────
-
-const builtin = @import("builtin");
-const gpa: std.mem.Allocator = if (builtin.target.cpu.arch == .wasm32)
-    .{ .ptr = undefined, .vtable = &dlmalloc_vtable }
-else
-    std.heap.page_allocator;
+const gpa = @import("alloc.zig").gpa;
 
 // ── Constants ────────────────────────────────────────────
 
@@ -345,20 +339,13 @@ fn decodeRuleNode(dec: *Decoder, rs: *CompiledRuleset) ?u16 {
     var node = RuleNode{};
 
     switch (op) {
-        OP_PATTERN => {
-            node.tag = .pattern;
-            const s = dec.readString() orelse return null;
-            node.str_offset = s.offset;
-            node.str_len = s.len;
-        },
-        OP_KIND => {
-            node.tag = .kind;
-            const s = dec.readString() orelse return null;
-            node.str_offset = s.offset;
-            node.str_len = s.len;
-        },
-        OP_REGEX => {
-            node.tag = .regex;
+        OP_PATTERN, OP_KIND, OP_REGEX => {
+            node.tag = switch (op) {
+                OP_PATTERN => .pattern,
+                OP_KIND => .kind,
+                OP_REGEX => .regex,
+                else => unreachable,
+            };
             const s = dec.readString() orelse return null;
             node.str_offset = s.offset;
             node.str_len = s.len;
@@ -367,22 +354,8 @@ fn decodeRuleNode(dec: *Decoder, rs: *CompiledRuleset) ?u16 {
             node.tag = .nth_child;
             node.index = dec.readU32() orelse return null;
         },
-        OP_ALL => {
-            node.tag = .all;
-            const count = dec.readU16() orelse return null;
-            node.children_start = children_pool_count;
-            node.children_count = count;
-
-            var ci: u16 = 0;
-            while (ci < count) : (ci += 1) {
-                if (children_pool_count >= MAX_CHILDREN) return null;
-                const child_idx = decodeRuleNode(dec, rs) orelse return null;
-                children_pool[children_pool_count] = child_idx;
-                children_pool_count += 1;
-            }
-        },
-        OP_ANY => {
-            node.tag = .any;
+        OP_ALL, OP_ANY => {
+            node.tag = if (op == OP_ALL) .all else .any;
             const count = dec.readU16() orelse return null;
             node.children_start = children_pool_count;
             node.children_count = count;
@@ -498,33 +471,6 @@ pub fn compilePatterns(
     }
 }
 
-// dlmalloc vtable for rule_engine (same as main.zig)
-extern fn malloc(usize) ?[*]u8;
-extern fn free(?[*]u8) void;
-extern fn realloc(?[*]u8, usize) ?[*]u8;
-
-const dlmalloc_vtable = std.mem.Allocator.VTable{
-    .alloc = struct {
-        fn f(_: *anyopaque, len: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
-            return malloc(len);
-        }
-    }.f,
-    .resize = struct {
-        fn f(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
-            return false;
-        }
-    }.f,
-    .free = struct {
-        fn f(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
-            free(memory.ptr);
-        }
-    }.f,
-    .remap = struct {
-        fn f(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) ?[*]u8 {
-            return realloc(memory.ptr, new_len);
-        }
-    }.f,
-};
 
 /// Free all compiled pattern handles owned by this ruleset.
 pub fn freePatterns(rs: *CompiledRuleset, compiled_slots: anytype) void {
@@ -578,33 +524,26 @@ fn isRelationalTag(tag: RuleNodeTag) bool {
     };
 }
 
-/// In-place filter: keep matches inside any context.
-fn filterInsideInPlace(out: *matcher.MatchList, contexts: *const matcher.MatchList) void {
+/// Generic in-place filter: for each match in `out`, check if any ref satisfies `predFn`.
+/// When `keep_on_match` is true, keep matches where a ref matched (positive filter).
+/// When `keep_on_match` is false, keep matches where no ref matched (negative filter).
+/// Comptime-dispatched — zero overhead vs hand-written per-filter functions.
+fn filterGeneric(
+    out: *matcher.MatchList,
+    refs: *const matcher.MatchList,
+    comptime predFn: fn (m: matcher.Match, ref: matcher.Match) bool,
+    comptime keep_on_match: bool,
+) void {
     var keep: u32 = 0;
     for (out.items[0..out.count]) |m| {
-        for (contexts.items[0..contexts.count]) |ctx| {
-            if (ctx.start_byte <= m.start_byte and ctx.end_byte >= m.end_byte) {
-                out.items[keep] = m;
-                keep += 1;
+        var matched = false;
+        for (refs.items[0..refs.count]) |ref_m| {
+            if (predFn(m, ref_m)) {
+                matched = true;
                 break;
             }
         }
-    }
-    out.count = keep;
-}
-
-/// In-place filter: keep matches NOT inside any context.
-fn filterNotInsideInPlace(out: *matcher.MatchList, contexts: *const matcher.MatchList) void {
-    var keep: u32 = 0;
-    for (out.items[0..out.count]) |m| {
-        var is_inside = false;
-        for (contexts.items[0..contexts.count]) |ctx| {
-            if (ctx.start_byte <= m.start_byte and ctx.end_byte >= m.end_byte) {
-                is_inside = true;
-                break;
-            }
-        }
-        if (!is_inside) {
+        if (matched == keep_on_match) {
             out.items[keep] = m;
             keep += 1;
         }
@@ -612,141 +551,72 @@ fn filterNotInsideInPlace(out: *matcher.MatchList, contexts: *const matcher.Matc
     out.count = keep;
 }
 
-/// In-place filter: keep matches that contain at least one sub-match.
+// ── Filter predicates (comptime) ─────────────────────────
+
+fn predInside(m: matcher.Match, ctx: matcher.Match) bool {
+    return ctx.start_byte <= m.start_byte and ctx.end_byte >= m.end_byte;
+}
+
+fn predHas(m: matcher.Match, sub: matcher.Match) bool {
+    return m.start_byte <= sub.start_byte and m.end_byte >= sub.end_byte;
+}
+
+fn predExact(m: matcher.Match, ex: matcher.Match) bool {
+    return m.start_byte == ex.start_byte and m.end_byte == ex.end_byte;
+}
+
+fn predFollows(m: matcher.Match, ref_m: matcher.Match) bool {
+    return ref_m.end_byte <= m.start_byte;
+}
+
+fn predPrecedes(m: matcher.Match, ref_m: matcher.Match) bool {
+    return ref_m.start_byte >= m.end_byte;
+}
+
+fn predOverlaps(m: matcher.Match, ref_m: matcher.Match) bool {
+    return m.start_byte < ref_m.end_byte and ref_m.start_byte < m.end_byte;
+}
+
+// ── Named filter wrappers ────────────────────────────────
+
+fn filterInsideInPlace(out: *matcher.MatchList, ctxs: *const matcher.MatchList) void {
+    filterGeneric(out, ctxs, predInside, true);
+}
+
+fn filterNotInsideInPlace(out: *matcher.MatchList, ctxs: *const matcher.MatchList) void {
+    filterGeneric(out, ctxs, predInside, false);
+}
+
 fn filterHasInPlace(out: *matcher.MatchList, subs: *const matcher.MatchList) void {
-    var keep: u32 = 0;
-    for (out.items[0..out.count]) |m| {
-        for (subs.items[0..subs.count]) |sub| {
-            if (m.start_byte <= sub.start_byte and m.end_byte >= sub.end_byte) {
-                out.items[keep] = m;
-                keep += 1;
-                break;
-            }
-        }
-    }
-    out.count = keep;
+    filterGeneric(out, subs, predHas, true);
 }
 
-/// In-place filter: keep matches that do NOT contain any sub-match.
 fn filterNotHasInPlace(out: *matcher.MatchList, subs: *const matcher.MatchList) void {
-    var keep: u32 = 0;
-    for (out.items[0..out.count]) |m| {
-        var has_sub = false;
-        for (subs.items[0..subs.count]) |sub| {
-            if (m.start_byte <= sub.start_byte and m.end_byte >= sub.end_byte) {
-                has_sub = true;
-                break;
-            }
-        }
-        if (!has_sub) {
-            out.items[keep] = m;
-            keep += 1;
-        }
-    }
-    out.count = keep;
+    filterGeneric(out, subs, predHas, false);
 }
 
-/// In-place filter: remove matches with exact byte range match in exclusion set.
 fn filterNotInPlace(out: *matcher.MatchList, excl: *const matcher.MatchList) void {
-    var keep: u32 = 0;
-    for (out.items[0..out.count]) |m| {
-        var excluded = false;
-        for (excl.items[0..excl.count]) |ex| {
-            if (m.start_byte == ex.start_byte and m.end_byte == ex.end_byte) {
-                excluded = true;
-                break;
-            }
-        }
-        if (!excluded) {
-            out.items[keep] = m;
-            keep += 1;
-        }
-    }
-    out.count = keep;
+    filterGeneric(out, excl, predExact, false);
 }
 
-/// In-place filter: keep matches where some ref ends before match starts.
 fn filterFollowsInPlace(out: *matcher.MatchList, refs: *const matcher.MatchList) void {
-    var keep: u32 = 0;
-    for (out.items[0..out.count]) |m| {
-        for (refs.items[0..refs.count]) |ref_m| {
-            if (ref_m.end_byte <= m.start_byte) {
-                out.items[keep] = m;
-                keep += 1;
-                break;
-            }
-        }
-    }
-    out.count = keep;
+    filterGeneric(out, refs, predFollows, true);
 }
 
-/// In-place filter: keep matches that do NOT follow any ref.
 fn filterNotFollowsInPlace(out: *matcher.MatchList, refs: *const matcher.MatchList) void {
-    var keep: u32 = 0;
-    for (out.items[0..out.count]) |m| {
-        var has_preceding = false;
-        for (refs.items[0..refs.count]) |ref_m| {
-            if (ref_m.end_byte <= m.start_byte) {
-                has_preceding = true;
-                break;
-            }
-        }
-        if (!has_preceding) {
-            out.items[keep] = m;
-            keep += 1;
-        }
-    }
-    out.count = keep;
+    filterGeneric(out, refs, predFollows, false);
 }
 
-/// In-place filter: keep matches where some ref starts after match ends.
 fn filterPrecedesInPlace(out: *matcher.MatchList, refs: *const matcher.MatchList) void {
-    var keep: u32 = 0;
-    for (out.items[0..out.count]) |m| {
-        for (refs.items[0..refs.count]) |ref_m| {
-            if (ref_m.start_byte >= m.end_byte) {
-                out.items[keep] = m;
-                keep += 1;
-                break;
-            }
-        }
-    }
-    out.count = keep;
+    filterGeneric(out, refs, predPrecedes, true);
 }
 
-/// In-place filter: keep matches that do NOT precede any ref.
 fn filterNotPrecedesInPlace(out: *matcher.MatchList, refs: *const matcher.MatchList) void {
-    var keep: u32 = 0;
-    for (out.items[0..out.count]) |m| {
-        var has_following = false;
-        for (refs.items[0..refs.count]) |ref_m| {
-            if (ref_m.start_byte >= m.end_byte) {
-                has_following = true;
-                break;
-            }
-        }
-        if (!has_following) {
-            out.items[keep] = m;
-            keep += 1;
-        }
-    }
-    out.count = keep;
+    filterGeneric(out, refs, predPrecedes, false);
 }
 
-/// In-place intersect: keep only items in `out` that overlap with `other`.
-/// No extra MatchList allocation needed.
 fn intersectInPlace(out: *matcher.MatchList, other: *const matcher.MatchList) void {
-    var keep: u32 = 0;
-    for (out.items[0..out.count]) |ma| {
-        for (other.items[0..other.count]) |mb| {
-            if (ma.start_byte < mb.end_byte and mb.start_byte < ma.end_byte) {
-                out.items[keep] = ma;
-                keep += 1;
-                break;
-            }
-        }
-    }
-    out.count = keep;
+    filterGeneric(out, other, predOverlaps, true);
 }
 
 /// In-place union: append items from `other` to `out` (deduplicated by byte range).
@@ -760,6 +630,28 @@ fn unionInPlace(out: *matcher.MatchList, other: *const matcher.MatchList) void {
             }
         }
         if (!dupe) out.add(mb);
+    }
+}
+
+/// Dispatch the correct in-place filter for a relational tag.
+/// When `negate` is true, uses the NOT variant.
+fn applyRelationalFilter(tag: RuleNodeTag, out: *matcher.MatchList, refs: *const matcher.MatchList, negate: bool) void {
+    if (negate) {
+        switch (tag) {
+            .inside => filterNotInsideInPlace(out, refs),
+            .has => filterNotHasInPlace(out, refs),
+            .follows => filterNotFollowsInPlace(out, refs),
+            .precedes => filterNotPrecedesInPlace(out, refs),
+            else => filterNotInPlace(out, refs),
+        }
+    } else {
+        switch (tag) {
+            .inside => filterInsideInPlace(out, refs),
+            .has => filterHasInPlace(out, refs),
+            .follows => filterFollowsInPlace(out, refs),
+            .precedes => filterPrecedesInPlace(out, refs),
+            else => {},
+        }
     }
 }
 
@@ -777,12 +669,10 @@ pub fn evaluate(
 
     switch (node.tag) {
         .pattern => {
-            if (node.compiled_handle > 0) {
-                const handle = node.compiled_handle;
-                if (handle > 0 and handle <= 64) {
-                    if (compiled_slots[handle - 1]) |slot| {
-                        matcher.searchMatches(slot.tree.rootNode(), source_root, out, 0);
-                    }
+            const handle = node.compiled_handle;
+            if (handle > 0 and handle <= 64) {
+                if (compiled_slots[handle - 1]) |slot| {
+                    matcher.searchMatches(slot.tree.rootNode(), source_root, out, 0);
                 }
             }
         },
@@ -834,59 +724,17 @@ pub fn evaluate(
                 const child_node = rs.nodes[child_idx];
                 if (!isRelationalTag(child_node.tag)) continue;
 
-                switch (child_node.tag) {
-                    .inside => {
-                        // Evaluate sub-rule → context ranges, filter: keep matches inside contexts
-                        evaluate(rs, child_node.child, source_root, compiled_slots, &eval_relational_temp);
-                        filterInsideInPlace(out, &eval_relational_temp);
-                    },
-                    .has => {
-                        // Evaluate sub-rule → sub-matches, filter: keep matches containing a sub-match
-                        evaluate(rs, child_node.child, source_root, compiled_slots, &eval_relational_temp);
-                        filterHasInPlace(out, &eval_relational_temp);
-                    },
-                    .follows => {
-                        // Evaluate sub-rule → refs, filter: keep matches preceded by a ref
-                        evaluate(rs, child_node.child, source_root, compiled_slots, &eval_relational_temp);
-                        filterFollowsInPlace(out, &eval_relational_temp);
-                    },
-                    .precedes => {
-                        // Evaluate sub-rule → refs, filter: keep matches followed by a ref
-                        evaluate(rs, child_node.child, source_root, compiled_slots, &eval_relational_temp);
-                        filterPrecedesInPlace(out, &eval_relational_temp);
-                    },
-                    .op_not => {
-                        // NOT inverts a sub-rule. Handle not+relational combos:
-                        const not_child = rs.nodes[child_node.child];
-                        switch (not_child.tag) {
-                            .inside => {
-                                // not { inside { ... } } → keep matches NOT inside contexts
-                                evaluate(rs, not_child.child, source_root, compiled_slots, &eval_relational_temp);
-                                filterNotInsideInPlace(out, &eval_relational_temp);
-                            },
-                            .has => {
-                                // not { has { ... } } → keep matches NOT containing sub-matches
-                                evaluate(rs, not_child.child, source_root, compiled_slots, &eval_relational_temp);
-                                filterNotHasInPlace(out, &eval_relational_temp);
-                            },
-                            .follows => {
-                                // not { follows { ... } } → keep matches NOT following refs
-                                evaluate(rs, not_child.child, source_root, compiled_slots, &eval_relational_temp);
-                                filterNotFollowsInPlace(out, &eval_relational_temp);
-                            },
-                            .precedes => {
-                                // not { precedes { ... } } → keep matches NOT preceding refs
-                                evaluate(rs, not_child.child, source_root, compiled_slots, &eval_relational_temp);
-                                filterNotPrecedesInPlace(out, &eval_relational_temp);
-                            },
-                            else => {
-                                // not { pattern/kind/etc } → remove exact byte matches
-                                evaluate(rs, child_node.child, source_root, compiled_slots, &eval_relational_temp);
-                                filterNotInPlace(out, &eval_relational_temp);
-                            },
-                        }
-                    },
-                    else => {},
+                if (child_node.tag == .op_not) {
+                    const not_child = rs.nodes[child_node.child];
+                    const eval_target = if (not_child.tag == .inside or not_child.tag == .has or not_child.tag == .follows or not_child.tag == .precedes)
+                        not_child.child
+                    else
+                        child_node.child;
+                    evaluate(rs, eval_target, source_root, compiled_slots, &eval_relational_temp);
+                    applyRelationalFilter(not_child.tag, out, &eval_relational_temp, true);
+                } else {
+                    evaluate(rs, child_node.child, source_root, compiled_slots, &eval_relational_temp);
+                    applyRelationalFilter(child_node.tag, out, &eval_relational_temp, false);
                 }
             }
         },
@@ -902,20 +750,8 @@ pub fn evaluate(
             // Standalone NOT: no primary matches to filter, returns empty.
             // Meaningful only inside `all` where the two-phase handler processes it.
         },
-        .inside => {
-            // Standalone: evaluate child to get context matches (pass-through).
-            evaluate(rs, node.child, source_root, compiled_slots, out);
-        },
-        .has => {
-            // Standalone: evaluate child to get sub-matches (pass-through).
-            evaluate(rs, node.child, source_root, compiled_slots, out);
-        },
-        .follows => {
-            // Standalone: evaluate child to get reference matches (pass-through).
-            evaluate(rs, node.child, source_root, compiled_slots, out);
-        },
-        .precedes => {
-            // Standalone: evaluate child to get reference matches (pass-through).
+        .inside, .has, .follows, .precedes => {
+            // Standalone relational: pass-through to child evaluation.
             evaluate(rs, node.child, source_root, compiled_slots, out);
         },
         .matches => {
@@ -939,17 +775,7 @@ fn collectByRegex(source_root: ts.Node, compiled: *regex.Regex, matches: *matche
         if (find_result) |m_val| {
             var m_copy = m_val;
             m_copy.deinit(gpa);
-            const sp = source_root.startPoint();
-            const ep = source_root.endPoint();
-            matches.add(.{
-                .start_byte = source_root.startByte(),
-                .end_byte = source_root.endByte(),
-                .start_row = sp.row,
-                .start_col = sp.col,
-                .end_row = ep.row,
-                .end_col = ep.col,
-                .bindings = .{},
-            });
+            matcher.addMatchFromNode(source_root, matches);
         }
     }
 
@@ -1017,10 +843,8 @@ pub fn applyAndSerialize(
     rs: *const CompiledRuleset,
     src_slot: anytype,
     compiled_slots: anytype,
-    _source_slots: anytype,
     buf: *[MAX_OUTPUT]u8,
 ) u32 {
-    _ = _source_slots;
     var stream = std.io.fixedBufferStream(buf);
     var w = stream.writer();
 

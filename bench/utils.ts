@@ -1,4 +1,46 @@
-/** Shared benchmark utilities. */
+/** Shared benchmark utilities and fixtures. */
+
+// ── Source fixtures ──────────────────────────────────────
+
+export const SMALL_SOURCE = `const x = eval(input);`;
+
+export const MEDIUM_SOURCE = `
+import { readFile } from 'fs';
+import fetch from 'node-fetch';
+
+function processData(input) {
+  const result = eval(input);
+  console.log(result);
+  return result;
+}
+
+async function fetchData(url) {
+  const response = await fetch(url);
+  const data = await response.json();
+  setTimeout(() => console.log(data), 1000);
+  return data;
+}
+
+export function main() {
+  const rawData = readFile('data.json');
+  processData(rawData);
+  fetchData('https://api.example.com/data');
+}
+`.trim();
+
+export const LARGE_SOURCE = Array.from({ length: 50 }, (_, i) => `
+function fn${i}(arg${i}) {
+  const val${i} = eval(arg${i});
+  console.log("result:", val${i});
+  setTimeout(() => process(val${i}), ${i * 100});
+  if (val${i} > 0) {
+    return fetch("https://api.example.com/" + val${i});
+  }
+  return null;
+}
+`).join("\n").trim();
+
+// ── Bench runner ─────────────────────────────────────────
 
 export interface BenchResult {
   name: string;

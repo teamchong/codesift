@@ -14,7 +14,7 @@
 import * as codesift from "../src/js/ts/index.js";
 import { encodeRules } from "../src/js/encoder.js";
 import { parse, Lang } from "@ast-grep/napi";
-import { bench, formatOps, formatNs, type BenchResult } from "./utils.js";
+import { bench, formatOps, formatNs, SMALL_SOURCE, MEDIUM_SOURCE, LARGE_SOURCE, type BenchResult } from "./utils.js";
 
 // ── Helpers ──────────────────────────────────────────────
 
@@ -42,46 +42,6 @@ function printGroup(group: string, rows: Array<[string, Result, Result]>) {
     console.log(`  ${label.padEnd(32)} ${formatNs(cs.avgNs).padStart(14)}  ${formatNs(ag.avgNs).padStart(14)}  ${winner.padStart(14)}`);
   }
 }
-
-// ── Source fixtures ──────────────────────────────────────
-
-const SMALL_SOURCE = `const x = eval(input);`;
-
-const MEDIUM_SOURCE = `
-import { readFile } from 'fs';
-import fetch from 'node-fetch';
-
-function processData(input) {
-  const result = eval(input);
-  console.log(result);
-  return result;
-}
-
-async function fetchData(url) {
-  const response = await fetch(url);
-  const data = await response.json();
-  setTimeout(() => console.log(data), 1000);
-  return data;
-}
-
-export function main() {
-  const rawData = readFile('data.json');
-  processData(rawData);
-  fetchData('https://api.example.com/data');
-}
-`.trim();
-
-const LARGE_SOURCE = Array.from({ length: 50 }, (_, i) => `
-function fn${i}(arg${i}) {
-  const val${i} = eval(arg${i});
-  console.log("result:", val${i});
-  setTimeout(() => process(val${i}), ${i * 100});
-  if (val${i} > 0) {
-    return fetch("https://api.example.com/" + val${i});
-  }
-  return null;
-}
-`).join("\n").trim();
 
 // ── Benchmarks ───────────────────────────────────────────
 

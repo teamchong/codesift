@@ -451,7 +451,7 @@ export class SgNode {
     wasm.node_root(this._srcHandle);
     const rootInfo = readNodeResult();
     const parentIsRoot = rootInfo && info.sb === rootInfo.sb && info.eb === rootInfo.eb && info.kind === rootInfo.kind;
-    return new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info, !!parentIsRoot);
+    return new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info, !!parentIsRoot, this._compile);
   }
 
   /** Next named sibling. */

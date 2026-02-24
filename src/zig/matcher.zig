@@ -431,6 +431,24 @@ fn searchMatchesInner(
     }
 }
 
+/// Add a match from a node (with deduplication).
+pub fn addMatchFromNode(node: ts.Node, matches: *MatchList) void {
+    const sb = node.startByte();
+    const eb = node.endByte();
+    if (isDuplicate(matches.slice(), sb, eb)) return;
+    const sp = node.startPoint();
+    const ep = node.endPoint();
+    matches.add(.{
+        .start_byte = sb,
+        .end_byte = eb,
+        .start_row = sp.row,
+        .start_col = sp.col,
+        .end_row = ep.row,
+        .end_col = ep.col,
+        .bindings = .{},
+    });
+}
+
 /// Try matching the pattern at a single source node, with optional kind pruning.
 fn tryMatch(pat: ts.Node, source_node: ts.Node, matches: *MatchList, target_kind: ?[]const u8) void {
     // Kind-based pruning: skip matchNode if source kind doesn't match pattern kind
@@ -533,65 +551,29 @@ pub fn intersect(a: *const MatchList, b: *const MatchList) MatchList {
 // ── Kind matching ─────────────────────────────────────────────
 
 /// Walk the tree and collect all nodes whose nodeType() matches `kind`.
+/// When `named_only` is false, walks ALL children (including extras like comments).
 pub fn collectByKind(source_root: ts.Node, kind: []const u8, matches: *MatchList, depth: u32) void {
-    if (depth > 200) return;
-
-    if (std.mem.eql(u8, source_root.nodeType(), kind)) {
-        const sb = source_root.startByte();
-        const eb = source_root.endByte();
-        if (!isDuplicate(matches.slice(), sb, eb)) {
-            const sp = source_root.startPoint();
-            const ep = source_root.endPoint();
-            matches.add(.{
-                .start_byte = sb,
-                .end_byte = eb,
-                .start_row = sp.row,
-                .start_col = sp.col,
-                .end_row = ep.row,
-                .end_col = ep.col,
-                .bindings = .{},
-            });
-        }
-    }
-
-    var i: u32 = 0;
-    while (i < source_root.namedChildCount()) : (i += 1) {
-        if (source_root.namedChild(i)) |child_node| {
-            collectByKind(child_node, kind, matches, depth + 1);
-        }
-    }
+    collectByKindImpl(source_root, kind, matches, depth, true);
 }
 
-// ── Kind matching (all children, including extras) ────────────
-
-/// Walk the tree using child()/childCount() and collect nodes by type.
-/// This sees "extra" nodes (comments) that namedChild() skips.
+/// Walk using child()/childCount() to see "extra" nodes (comments) that namedChild() skips.
 pub fn collectByKindAll(source_root: ts.Node, kind: []const u8, matches: *MatchList, depth: u32) void {
+    collectByKindImpl(source_root, kind, matches, depth, false);
+}
+
+fn collectByKindImpl(source_root: ts.Node, kind: []const u8, matches: *MatchList, depth: u32, named_only: bool) void {
     if (depth > 200) return;
 
     if (std.mem.eql(u8, source_root.nodeType(), kind)) {
-        const sb = source_root.startByte();
-        const eb = source_root.endByte();
-        if (!isDuplicate(matches.slice(), sb, eb)) {
-            const sp = source_root.startPoint();
-            const ep = source_root.endPoint();
-            matches.add(.{
-                .start_byte = sb,
-                .end_byte = eb,
-                .start_row = sp.row,
-                .start_col = sp.col,
-                .end_row = ep.row,
-                .end_col = ep.col,
-                .bindings = .{},
-            });
-        }
+        addMatchFromNode(source_root, matches);
     }
 
-    // Walk ALL children (including extras like comments)
+    const count = if (named_only) source_root.namedChildCount() else source_root.childCount();
     var i: u32 = 0;
-    while (i < source_root.childCount()) : (i += 1) {
-        if (source_root.child(i)) |child_node| {
-            collectByKindAll(child_node, kind, matches, depth + 1);
+    while (i < count) : (i += 1) {
+        const child_node = if (named_only) source_root.namedChild(i) else source_root.child(i);
+        if (child_node) |ch| {
+            collectByKindImpl(ch, kind, matches, depth + 1, named_only);
         }
     }
 }
@@ -689,17 +671,7 @@ pub fn collectPrecedingSiblings(source_root: ts.Node, node_start: u32, node_end:
     const target = findNodeAtRange(source_root, node_start, node_end, 0) orelse return;
     var current = target;
     while (current.prevNamedSibling()) |sib| {
-        const sp = sib.startPoint();
-        const ep = sib.endPoint();
-        matches.add(.{
-            .start_byte = sib.startByte(),
-            .end_byte = sib.endByte(),
-            .start_row = sp.row,
-            .start_col = sp.col,
-            .end_row = ep.row,
-            .end_col = ep.col,
-            .bindings = .{},
-        });
+        addMatchFromNode(sib, matches);
         current = sib;
     }
 }
@@ -709,17 +681,7 @@ pub fn collectFollowingSiblings(source_root: ts.Node, node_start: u32, node_end:
     const target = findNodeAtRange(source_root, node_start, node_end, 0) orelse return;
     var current = target;
     while (current.nextNamedSibling()) |sib| {
-        const sp = sib.startPoint();
-        const ep = sib.endPoint();
-        matches.add(.{
-            .start_byte = sib.startByte(),
-            .end_byte = sib.endByte(),
-            .start_row = sp.row,
-            .start_col = sp.col,
-            .end_row = ep.row,
-            .end_col = ep.col,
-            .bindings = .{},
-        });
+        addMatchFromNode(sib, matches);
         current = sib;
     }
 }
@@ -734,17 +696,7 @@ pub fn collectByNthChild(source_root: ts.Node, index: u32, matches: *MatchList, 
     if (source_root.parent()) |par| {
         if (par.namedChild(index)) |nth| {
             if (nth.startByte() == source_root.startByte() and nth.endByte() == source_root.endByte()) {
-                const sp = source_root.startPoint();
-                const ep = source_root.endPoint();
-                matches.add(.{
-                    .start_byte = source_root.startByte(),
-                    .end_byte = source_root.endByte(),
-                    .start_row = sp.row,
-                    .start_col = sp.col,
-                    .end_row = ep.row,
-                    .end_col = ep.col,
-                    .bindings = .{},
-                });
+                addMatchFromNode(source_root, matches);
             }
         }
     }
