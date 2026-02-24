@@ -1,5 +1,23 @@
 export type Language = "javascript" | "typescript" | "tsx";
 
+// ── Language utilities ───────────────────────────────────
+
+const LANG_MAP: Record<Language, number> = { javascript: 1, typescript: 2, tsx: 3 };
+
+export function langToInt(lang: Language): number {
+  return LANG_MAP[lang];
+}
+
+export function detectLanguage(filename: string): Language {
+  if (filename.endsWith(".tsx")) return "tsx";
+  if (filename.endsWith(".ts")) return "typescript";
+  return "javascript";
+}
+
+export function isWasmLanguage(lang: Language): boolean {
+  return lang in LANG_MAP;
+}
+
 // ── Rule engine types ─────────────────────────────────────
 
 export type StopBy = "end" | "neighbor" | RuleNode;

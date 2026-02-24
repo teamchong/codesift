@@ -6,14 +6,15 @@
  */
 import * as vm from "node:vm";
 import * as fs from "node:fs";
-import { detectLanguage, isWasmLanguage } from "./ts/index.js";
-import type {
-  Language,
-  TraceOptions,
-  TraceEvent,
-  TraceFinding,
-  TraceResult,
-  Confidence,
+import {
+  detectLanguage,
+  isWasmLanguage,
+  type Language,
+  type TraceOptions,
+  type TraceEvent,
+  type TraceFinding,
+  type TraceResult,
+  type Confidence,
 } from "./types.js";
 
 // ── Proxy runtime (injected into sandbox) ────────────────

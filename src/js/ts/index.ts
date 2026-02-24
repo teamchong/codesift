@@ -1,7 +1,9 @@
 import { wasmBase64 } from "./engine-wasm.generated.js";
+import { langToInt, isWasmLanguage } from "../types.js";
 import type { Language, Finding, Match, RichMatch, NodeInfo } from "../types.js";
 
 export type { Language, RuleDefinition, RuleNode, StopBy, MetavarConstraint, TransformOp, Finding, Match, RichMatch, NodeInfo, TraceOptions, TraceEvent, TraceFinding, TraceResult, Confidence } from "../types.js";
+export { langToInt, detectLanguage, isWasmLanguage } from "../types.js";
 export { encodeRules } from "../encoder.js";
 export { rewriteSource, trace, traceFile } from "../trace.js";
 
@@ -133,24 +135,6 @@ function readNodeArrayResult(): NodeInfo[] {
   const len = wasm.get_result_len();
   if (len === 0) return [];
   return JSON.parse(dec.decode(new Uint8Array(wasm.memory.buffer, ptr, len)));
-}
-
-// ── Language utilities ───────────────────────────────────
-
-const LANG_MAP: Record<Language, number> = { javascript: 1, typescript: 2, tsx: 3 };
-
-export function langToInt(lang: Language): number {
-  return LANG_MAP[lang];
-}
-
-export function detectLanguage(filename: string): Language {
-  if (filename.endsWith(".tsx")) return "tsx";
-  if (filename.endsWith(".ts")) return "typescript";
-  return "javascript";
-}
-
-export function isWasmLanguage(lang: Language): boolean {
-  return lang in LANG_MAP;
 }
 
 // ── Pattern matching ─────────────────────────────────────
