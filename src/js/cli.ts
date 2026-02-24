@@ -11,7 +11,8 @@ import {
   type Finding,
 } from "./ts/index.js";
 import { encodeRules } from "./encoder.js";
-import type { RuleDefinition, Language } from "./types.js";
+import { traceFile } from "./trace.js";
+import type { RuleDefinition, Language, Confidence } from "./types.js";
 
 // ── Argument parsing ─────────────────────────────────────
 
@@ -386,8 +387,72 @@ function cmdTest(flags: Record<string, string | boolean>): void {
   process.exit(failed > 0 ? 1 : 0);
 }
 
+function cmdTrace(positionals: string[], flags: Record<string, string | boolean>): void {
+  const filePath = positionals[0];
+  if (!filePath) {
+    console.error("Error: file argument is required");
+    console.error("Usage: codesift trace <file> [--timeout 5000] [--confidence high|medium|low] [--format text|json]");
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(filePath)) {
+    console.error(`Error: file not found: ${filePath}`);
+    process.exit(1);
+  }
+
+  const format = (flags.format as string) ?? "text";
+  const minConfidence = (flags.confidence as Confidence) ?? "medium";
+  const timeout = flags.timeout ? Number(flags.timeout) : undefined;
+  const maxCalls = flags["max-calls"] ? Number(flags["max-calls"]) : undefined;
+  const maxLoopIters = flags["max-loop-iters"] ? Number(flags["max-loop-iters"]) : undefined;
+
+  const confidenceOrder: Record<Confidence, number> = { high: 3, medium: 2, low: 1 };
+  const minLevel = confidenceOrder[minConfidence] ?? 2;
+
+  const result = traceFile(filePath, {
+    timeout,
+    thresholds: {
+      ...(maxCalls !== undefined && { maxCalls }),
+      ...(maxLoopIters !== undefined && { maxLoopIters }),
+    },
+  });
+
+  const filtered = result.findings.filter(
+    (f) => confidenceOrder[f.confidence] >= minLevel,
+  );
+
+  if (format === "json") {
+    console.log(JSON.stringify({ ...result, findings: filtered }, null, 2));
+  } else {
+    // Text format
+    if (result.timedOut) {
+      console.log("⚠ Execution timed out");
+    }
+    console.log(`Traced ${filePath} in ${result.durationMs.toFixed(1)}ms — ${result.events.length} event(s)\n`);
+
+    if (filtered.length === 0) {
+      console.log("No findings above confidence threshold.");
+    } else {
+      for (const f of filtered) {
+        const icon = f.severity === "error" ? "✗" : f.severity === "warning" ? "⚠" : "ℹ";
+        console.log(`  ${icon} [${f.confidence}] ${f.id}: ${f.message}`);
+        if (f.caveat) {
+          console.log(`    ↳ ${f.caveat}`);
+        }
+      }
+    }
+
+    console.log(`\n${filtered.length} finding(s) (confidence ≥ ${minConfidence})`);
+    if (minConfidence !== "low" && result.findings.length > filtered.length) {
+      console.log(`  (${result.findings.length - filtered.length} lower-confidence finding(s) hidden; use --confidence low to show all)`);
+    }
+  }
+
+  process.exit(filtered.length > 0 ? 1 : 0);
+}
+
 function showHelp(): void {
-  console.log(`codesift — Embeddable WASM-based structural code pattern matcher
+  console.log(`codesift — Structural code analysis + behavioral tracing
 
 Commands:
   scan [files...] --rules <path>     Scan files with JSON rules
@@ -397,6 +462,13 @@ Commands:
     --lang js|ts|tsx                 Language (default: auto-detect)
     --format text|json               Output format (default: text)
 
+  trace <file>                       Behavioral trace via proxy execution
+    --timeout <ms>                   Execution timeout (default: 5000)
+    --confidence high|medium|low     Min confidence to show (default: medium)
+    --max-calls <n>                  Max calls threshold (default: 1000)
+    --max-loop-iters <n>             Max loop iterations (default: 10000)
+    --format text|json               Output format (default: text)
+
   compile <rules.json> [-o out.bin]  Pre-compile rules to bytecode
 
   test --rules <dir>                 Test rules against fixtures
@@ -404,6 +476,8 @@ Commands:
 Examples:
   codesift run "eval(\\$X)" src/
   codesift scan --rules rules/ src/
+  codesift trace suspicious.js
+  codesift trace script.js --confidence low --timeout 10000
   codesift compile rules.json -o rules.bin
 `);
 }
@@ -417,6 +491,9 @@ function main(): void {
       break;
     case "run":
       cmdRun(positionals, flags);
+      break;
+    case "trace":
+      cmdTrace(positionals, flags);
       break;
     case "compile":
       cmdCompile(positionals, flags);

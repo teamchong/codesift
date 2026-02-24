@@ -64,6 +64,52 @@ export interface Finding {
   matches: Match[];
 }
 
+// ── Trace types ──────────────────────────────────────────
+
+export type Confidence = "high" | "medium" | "low";
+
+export interface TraceOptions {
+  /** Execution timeout in ms (default: 5000) */
+  timeout?: number;
+  /** Custom global stubs: name → value (injected into sandbox) */
+  globals?: Record<string, unknown>;
+  /** Thresholds that trigger findings */
+  thresholds?: {
+    /** Max calls to a single function before flagging (default: 1000) */
+    maxCalls?: number;
+    /** Max iterations of a single loop before flagging (default: 10000) */
+    maxLoopIters?: number;
+  };
+}
+
+export interface TraceEvent {
+  type: "call" | "get" | "set" | "construct";
+  /** Fully-qualified name, e.g. "fs.readFileSync", "console.log" */
+  target: string;
+  count: number;
+  /** Sample of stringified arg lists (max 5) */
+  args?: string[][];
+}
+
+export interface TraceFinding {
+  id: string;
+  severity: "error" | "warning" | "info";
+  message: string;
+  confidence: Confidence;
+  event: TraceEvent;
+  /** Explanation when confidence < high (why this might be a false positive) */
+  caveat?: string;
+}
+
+export interface TraceResult {
+  events: TraceEvent[];
+  findings: TraceFinding[];
+  /** True if execution hit the timeout */
+  timedOut: boolean;
+  /** Wall-clock execution time in ms */
+  durationMs: number;
+}
+
 // ── Tree traversal types ─────────────────────────────────
 
 /** Raw node descriptor returned from WASM. */

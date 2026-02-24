@@ -1,8 +1,9 @@
 import { wasmBase64 } from "./engine-wasm.generated.js";
 import type { Language, Finding, Match, RichMatch, NodeInfo } from "../types.js";
 
-export type { Language, RuleDefinition, RuleNode, StopBy, MetavarConstraint, TransformOp, Finding, Match, RichMatch, NodeInfo } from "../types.js";
+export type { Language, RuleDefinition, RuleNode, StopBy, MetavarConstraint, TransformOp, Finding, Match, RichMatch, NodeInfo, TraceOptions, TraceEvent, TraceFinding, TraceResult, Confidence } from "../types.js";
 export { encodeRules } from "../encoder.js";
+export { rewriteSource, trace, traceFile } from "../trace.js";
 
 function decodeBase64(b64: string): Uint8Array {
   if (typeof Buffer !== "undefined")
