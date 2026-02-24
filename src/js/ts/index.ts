@@ -143,15 +143,7 @@ function readNodeArrayResult(): NodeInfo[] {
 // ── Pattern matching ─────────────────────────────────────
 
 export function extractMatchText(source: string, m: Match): string {
-  const lines = source.split("\n");
-  if (m.start_row === m.end_row) {
-    return (lines[m.start_row] ?? "").slice(m.start_col, m.end_col);
-  }
-  const parts: string[] = [];
-  parts.push((lines[m.start_row] ?? "").slice(m.start_col));
-  for (let i = m.start_row + 1; i < m.end_row; i++) parts.push(lines[i] ?? "");
-  parts.push((lines[m.end_row] ?? "").slice(0, m.end_col));
-  return parts.join("\n");
+  return dec.decode(enc.encode(source).slice(m.start_byte, m.end_byte));
 }
 
 /** One-shot pattern match against source code. */
@@ -281,7 +273,7 @@ export function createScanner(
       const results: RichMatch[] = [];
       for (const pat of patterns) {
         for (const m of rawMatch(pat)) {
-          results.push({ ...m, pattern: pat, text: extractMatchText(source, m) });
+          results.push({ ...m, pattern: pat, text: dec.decode(sourceBytes.slice(m.start_byte, m.end_byte)) });
         }
       }
       return results;
