@@ -355,9 +355,10 @@ export class SgNode {
   private _info: NodeInfo;
   private _isRoot: boolean;
   private _compile: ((pattern: string) => number) | null;
+  private _rootInfo: NodeInfo | null;
 
   /** @internal — use scanner.root() to create */
-  constructor(srcHandle: number, lang: Language, source: string, sourceBytes: Uint8Array, info: NodeInfo, isRoot = false, compileFn: ((pattern: string) => number) | null = null) {
+  constructor(srcHandle: number, lang: Language, source: string, sourceBytes: Uint8Array, info: NodeInfo, isRoot = false, compileFn: ((pattern: string) => number) | null = null, rootInfo: NodeInfo | null = null) {
     this._srcHandle = srcHandle;
     this._lang = lang;
     this._source = source;
@@ -365,13 +366,14 @@ export class SgNode {
     this._info = info;
     this._isRoot = isRoot;
     this._compile = compileFn;
+    this._rootInfo = isRoot ? info : rootInfo;
   }
 
   private _ir(): number { return this._isRoot ? 1 : 0; }
 
   private _makeNode(info: NodeInfo | null): SgNode | null {
     if (!info) return null;
-    return new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info, false, this._compile);
+    return new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info, false, this._compile, this._rootInfo);
   }
 
   /** Node type string (e.g. "call_expression", "identifier"). */
@@ -439,11 +441,10 @@ export class SgNode {
     wasm.node_parent(this._srcHandle, this._info.sb, this._info.eb, 0);
     const info = readNodeResult();
     if (!info) return null;
-    // Check if parent is root (program node at top level)
-    wasm.node_root(this._srcHandle);
-    const rootInfo = readNodeResult();
-    const parentIsRoot = rootInfo && info.sb === rootInfo.sb && info.eb === rootInfo.eb && info.kind === rootInfo.kind;
-    return new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info, !!parentIsRoot, this._compile);
+    // Check if parent is root using cached root info (avoids second WASM call)
+    const ri = this._rootInfo;
+    const parentIsRoot = ri !== null && info.sb === ri.sb && info.eb === ri.eb;
+    return new SgNode(this._srcHandle, this._lang, this._source, this._sourceBytes, info, parentIsRoot, this._compile, this._rootInfo);
   }
 
   /** Next named sibling. */

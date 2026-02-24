@@ -156,9 +156,10 @@ const CompiledPattern = struct {
 
 var compiled_slots: [MAX_COMPILED]?CompiledPattern = .{null} ** MAX_COMPILED;
 
-fn findFreeSlot() ?u32 {
-    for (0..MAX_COMPILED) |i| {
-        if (compiled_slots[i] == null) return @intCast(i);
+/// Generic slot finder — replaces 4 identical findFreeXxxSlot functions.
+fn findFree(comptime T: type, comptime N: usize, slots: *const [N]?T) ?u32 {
+    for (0..N) |i| {
+        if (slots[i] == null) return @intCast(i);
     }
     return null;
 }
@@ -170,7 +171,7 @@ export fn compile_pattern(
     pattern_len: u32,
     lang: u32,
 ) u32 {
-    const slot_idx = findFreeSlot() orelse return 0;
+    const slot_idx = findFree(CompiledPattern, MAX_COMPILED, &compiled_slots) orelse return 0;
     const pattern_source = pattern_ptr[0..pattern_len];
     const ts_lang = toTsLang(lang);
 
@@ -267,20 +268,13 @@ const CompiledSource = struct {
 
 var source_slots: [MAX_SOURCES]?CompiledSource = .{null} ** MAX_SOURCES;
 
-fn findFreeSourceSlot() ?u32 {
-    for (0..MAX_SOURCES) |i| {
-        if (source_slots[i] == null) return @intCast(i);
-    }
-    return null;
-}
-
 /// Compile source code and cache the parsed AST. Returns a 1-based handle.
 export fn compile_source(
     source_ptr: [*]const u8,
     source_len: u32,
     lang: u32,
 ) u32 {
-    const slot_idx = findFreeSourceSlot() orelse return 0;
+    const slot_idx = findFree(CompiledSource, MAX_SOURCES, &source_slots) orelse return 0;
     const source = source_ptr[0..source_len];
     const ts_lang = toTsLang(lang);
 
@@ -359,55 +353,28 @@ const MAX_MATCH_SLOTS = 4;
 var last_match_list: matcher.MatchList = .{};
 var match_slots: [MAX_MATCH_SLOTS]?matcher.MatchList = .{null} ** MAX_MATCH_SLOTS;
 
-fn findFreeMatchSlot() ?u32 {
-    for (0..MAX_MATCH_SLOTS) |i| {
-        if (match_slots[i] == null) return @intCast(i);
-    }
-    return null;
-}
-
 /// Move last_match_list into a slot. Returns 1-based handle (0 = error).
 export fn store_matches() u32 {
-    const idx = findFreeMatchSlot() orelse return 0;
+    const idx = findFree(matcher.MatchList, MAX_MATCH_SLOTS, &match_slots) orelse return 0;
     match_slots[idx] = last_match_list;
     return idx + 1;
 }
 
-/// Filter: keep matches inside context. Result → buf + last_match_list.
-export fn filter_inside(matches_h: u32, ctx_h: u32) void {
+/// Shared filter dispatch — validates handles, copies first slot, applies filter, serializes.
+fn runFilter(matches_h: u32, ctx_h: u32, comptime filterFn: fn (*matcher.MatchList, *const matcher.MatchList) matcher.MatchList) void {
     if (matches_h == 0 or matches_h > MAX_MATCH_SLOTS) { writeEmptyArray(); return; }
     if (ctx_h == 0 or ctx_h > MAX_MATCH_SLOTS) { writeEmptyArray(); return; }
     const m_slot = match_slots[matches_h - 1] orelse { writeEmptyArray(); return; };
     const c_slot = match_slots[ctx_h - 1] orelse { writeEmptyArray(); return; };
     var m_copy = m_slot;
-    const result = matcher.filterInside(&m_copy, &c_slot);
+    const result = filterFn(&m_copy, &c_slot);
     last_match_list = result;
     result_len = serializeMatches(&result, &result_buf);
 }
 
-/// Filter: keep matches NOT inside context. Result → buf + last_match_list.
-export fn filter_not_inside(matches_h: u32, ctx_h: u32) void {
-    if (matches_h == 0 or matches_h > MAX_MATCH_SLOTS) { writeEmptyArray(); return; }
-    if (ctx_h == 0 or ctx_h > MAX_MATCH_SLOTS) { writeEmptyArray(); return; }
-    const m_slot = match_slots[matches_h - 1] orelse { writeEmptyArray(); return; };
-    const c_slot = match_slots[ctx_h - 1] orelse { writeEmptyArray(); return; };
-    var m_copy = m_slot;
-    const result = matcher.filterNotInside(&m_copy, &c_slot);
-    last_match_list = result;
-    result_len = serializeMatches(&result, &result_buf);
-}
-
-/// Filter: remove matches with same byte range as exclusions.
-export fn filter_not(matches_h: u32, excl_h: u32) void {
-    if (matches_h == 0 or matches_h > MAX_MATCH_SLOTS) { writeEmptyArray(); return; }
-    if (excl_h == 0 or excl_h > MAX_MATCH_SLOTS) { writeEmptyArray(); return; }
-    const m_slot = match_slots[matches_h - 1] orelse { writeEmptyArray(); return; };
-    const e_slot = match_slots[excl_h - 1] orelse { writeEmptyArray(); return; };
-    var m_copy = m_slot;
-    const result = matcher.filterNot(&m_copy, &e_slot);
-    last_match_list = result;
-    result_len = serializeMatches(&result, &result_buf);
-}
+export fn filter_inside(matches_h: u32, ctx_h: u32) void { runFilter(matches_h, ctx_h, matcher.filterInside); }
+export fn filter_not_inside(matches_h: u32, ctx_h: u32) void { runFilter(matches_h, ctx_h, matcher.filterNotInside); }
+export fn filter_not(matches_h: u32, excl_h: u32) void { runFilter(matches_h, excl_h, matcher.filterNot); }
 
 /// Intersect two match lists.
 export fn intersect_matches(a_h: u32, b_h: u32) void {
@@ -643,17 +610,10 @@ const rule_engine = @import("rule_engine.zig");
 const MAX_RULESETS = 2;
 var ruleset_slots: [MAX_RULESETS]?rule_engine.CompiledRuleset = .{null} ** MAX_RULESETS;
 
-fn findFreeRulesetSlot() ?u32 {
-    for (0..MAX_RULESETS) |i| {
-        if (ruleset_slots[i] == null) return @intCast(i);
-    }
-    return null;
-}
-
 /// Decode bytecode → CompiledRuleset, compile all patterns → handles.
 /// Returns 1-based ruleset handle (0 = error).
 export fn load_ruleset(bytecode_ptr: [*]const u8, bytecode_len: u32) u32 {
-    const slot_idx = findFreeRulesetSlot() orelse return 0;
+    const slot_idx = findFree(rule_engine.CompiledRuleset, MAX_RULESETS, &ruleset_slots) orelse return 0;
     const bytecode = bytecode_ptr[0..bytecode_len];
 
     var rs = rule_engine.decode(bytecode) orelse return 0;
